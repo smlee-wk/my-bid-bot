@@ -6,63 +6,63 @@ import json
 from datetime import datetime, timedelta
 from oauth2client.service_account import ServiceAccountCredentials
 
-# --- 사용자 설정 ---
+# --- 1. 사용자 설정 ---
 KEYWORDS = ['브랜딩', '브랜드', '리브랜딩', 'BI', 'CI', '네이밍', '마케팅', '컨설팅', '판로', '입점', '창업', '소상공인', '중소기업', '스타트업', '전략', '기획', '파트너', '멘토']
-EXCLUDE_KEYWORDS = ['실행', '대행'] # 테스트를 위해 '운영', '제작' 제외해봄
+EXCLUDE_KEYWORDS = ['실행', '대행', '운영', '제작']
 MY_INDUSTRIES = ['1169', '4440', '9999']
 MY_REGION = '서울특별시'
 
 def fetch_bids():
     all_data = []
-    # 테스트를 위해 7일치 수집
-    time_limit = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
-    url = 'http://apis.data.go.kr/1230000/BidPublicInfoService05/getBidPblancListInfoServcPPSSrch'
+    # 최신 공고부터 7일치 수집 (500 에러 방지를 위해 날짜 범위 명시)
+    now = datetime.now()
+    start_date = (now - timedelta(days=7)).strftime('%Y%m%d0000')
+    end_date = now.strftime('%Y%m%d2359')
     
+    # [수정] 포털에 명시된 최신 End Point 주소 적용
+    url = 'https://apis.data.go.kr/1230000/BidPublicInfoService/getBidPblancListInfoServcPPSSrch'
+    
+    # 서비스키 처리 (Decoding 키 사용 권장)
     service_key = os.environ.get('SERVICE_KEY')
     
     for kw in KEYWORDS:
         params = {
-            'serviceKey': service_key,
+            'serviceKey': requests.utils.unquote(service_key) if '%' in service_key else service_key,
             'numOfRows': '100',
+            'pageNo': '1',
+            'inprogrsBidPblancYn': 'Y',
             'bidNtceNm': kw,
+            'bidNtceBgnDt': start_date,
+            'bidNtceEndDt': end_date,
             'type': 'json'
         }
         
         try:
-            res = requests.get(url, params=params, timeout=10)
-            print(f"--- 키워드 '{kw}' 검색 결과 ---")
+            # 타임아웃을 20초로 늘려 서버 응답 대기
+            res = requests.get(url, params=params, timeout=20)
             
             if res.status_code != 200:
-                print(f"API 호출 실패 (상태코드: {res.status_code})")
+                print(f"[{kw}] 호출 실패: 상태코드 {res.status_code}")
                 continue
                 
-            data = res.json()
-            items = data.get('response', {}).get('body', {}).get('items', [])
-            
-            if not items:
-                print(f"검색된 공고 없음")
-                continue
+            items = res.json().get('response', {}).get('body', {}).get('items', [])
+            if not items: continue
 
-            print(f"검색된 공고 수: {len(items)}")
+            print(f"[{kw}] 검색됨: {len(items)}건")
             
             for item in items:
                 title = item.get('bidNtceNm', '')
                 inst_name = item.get('ntceInstNm', '')
                 
-                # 로그 확인용 (무엇이 걸러지는지 보기 위해)
-                # if any(ex in title for ex in EXCLUDE_KEYWORDS): 
-                #     print(f"[제외됨 - 키워드]: {title}")
-                #     continue
-
-                # 시간 필터
-                if item['bidNtceDt'] < time_limit: continue
+                # [필터] 제외 키워드
+                if any(ex in title for ex in EXCLUDE_KEYWORDS): continue
                 
-                # 지역 필터 (비어있으면 통과 포함)
+                # [필터] 지역 (서울 또는 전국/제한없음)
                 region = item.get('rgstRt', '')
                 is_region_ok = not region or any(r in region for r in [MY_REGION, '전국', '제한없음', '전체'])
                 if not is_region_ok: continue
                 
-                # 업종 필터 (비어있거나 참조면 통과 포함)
+                # [필터] 업종 (내 코드 포함 또는 제한없음/참조)
                 limit_yn = item.get('bidNtcePartcptnIndstryLmtYn', 'N')
                 ind_name = item.get('indstryTy', '')
                 is_ind_ok = (limit_yn == 'N' or not ind_name or 
@@ -70,7 +70,7 @@ def fetch_bids():
                              any(code in ind_name for code in MY_INDUSTRIES))
                 if not is_ind_ok: continue
 
-                # 가격 정보
+                # 가격 포맷팅
                 raw_price = item.get('assignAmt', '0')
                 try:
                     price = "{:,}".format(int(float(raw_price))) if raw_price else "0"
@@ -84,24 +84,28 @@ def fetch_bids():
                     item['bidNtceDt'], item['bidNtceDtlUrl']
                 ])
         except Exception as e:
-            print(f"에러 발생: {e}")
+            print(f"에러 ({kw}): {e}")
             
+    # 중복 제거 후 반환
+    if not all_data: return []
     return pd.DataFrame(all_data).drop_duplicates().values.tolist()
 
 def update_sheet(data):
     if not data:
-        print("최종 수집된 공고가 0건입니다. (필터링에 의해 모두 제거되었을 수 있음)")
+        print("수집된 공고가 없습니다.")
         return
     try:
         creds_dict = json.loads(os.environ.get('GOOGLE_CREDS'))
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive'])
         client = gspread.authorize(creds)
+        
+        # 시트 이름 '나라장터_수집' 확인 필수
         sheet = client.open("나라장터_수집").get_worksheet(0)
         sheet.append_rows(data)
-        print(f"성공: {len(data)}건의 공고를 시트에 추가했습니다.")
+        print(f"성공: {len(data)}건 업데이트 완료")
     except Exception as e:
         print(f"시트 업데이트 에러: {e}")
 
 if __name__ == "__main__":
-    bids = fetch_bids()
-    update_sheet(bids)
+    results = fetch_bids()
+    update_sheet(results)
