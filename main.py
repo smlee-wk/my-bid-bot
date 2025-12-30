@@ -8,7 +8,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 # --- 1. 사용자 설정 ---
 KEYWORDS = ['브랜딩', '브랜드', '리브랜딩', 'BI', 'CI', '네이밍', '마케팅', '컨설팅', '판로', '입점', '창업', '소상공인', '중소기업', '스타트업', '전략', '기획', '파트너', '멘토']
-EXCLUDE_KEYWORDS = ['실행', '대행', '운영', '제작']
+EXCLUDE_KEYWORDS = ['실행', '제작']
 MY_INDUSTRIES = ['1169', '4440', '9999']
 MY_REGION = '서울특별시'
 
@@ -20,10 +20,28 @@ def fetch_bids():
     end_date = now.strftime('%Y%m%d2359')
     
     # [수정] 포털에 명시된 최신 End Point 주소 적용
-    url = 'https://apis.data.go.kr/1230000/BidPublicInfoService/getBidPblancListInfoServcPPSSrch'
+    url = 'https://apis.data.go.kr/1230000/ad/BidPublicInfoService/getBidPblancListInfoServcPPSSrch'
     
-    # 서비스키 처리 (Decoding 키 사용 권장)
-    service_key = os.environ.get('SERVICE_KEY')
+    # ... 생략 ...
+    for kw in KEYWORDS:
+        # 1. 키를 안전하게 처리
+        decoded_key = requests.utils.unquote(service_key)
+        
+        # 2. params에서 serviceKey를 제외하고 정의
+        params = {
+            'numOfRows': '100',
+            'pageNo': '1',
+            'inprogrsBidPblancYn': 'Y',
+            'bidNtceNm': kw,
+            'bidNtceBgnDt': start_date,
+            'bidNtceEndDt': end_date,
+            'type': 'json'
+        }
+        
+        try:
+            # 3. URL에 인증키를 직접 결합하여 보냄 (가장 확실한 방법)
+            full_url = f"{url}?serviceKey={service_key}" # 혹은 decoded_key
+            res = requests.get(full_url, params=params, timeout=20)
     
     for kw in KEYWORDS:
         params = {
