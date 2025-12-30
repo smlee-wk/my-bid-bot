@@ -8,14 +8,14 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 # --- 사용자 설정 ---
 KEYWORDS = ['브랜딩', '브랜드', '리브랜딩', 'BI', 'CI', '네이밍', '마케팅', '컨설팅', '판로', '입점', '창업', '소상공인', '중소기업', '스타트업', '전략', '기획', '파트너', '멘토']
-EXCLUDE_KEYWORDS = ['실행', '대행', '운영', '제작']
+EXCLUDE_KEYWORDS = ['실행', '제작']
 MY_INDUSTRIES = ['1169', '4440', '9999']
 MY_REGION = '서울특별시'
 
 def fetch_bids():
     all_data = []
     # 한국 시간 기준 어제 오전 9시 이후 공고 (UTC 0시 기준 실행용)
-    time_limit = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+    time_limit = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
     url = 'http://apis.data.go.kr/1230000/BidPublicInfoService05/getBidPblancListInfoServcPPSSrch'
     
     for kw in KEYWORDS:
