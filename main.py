@@ -20,7 +20,7 @@ def fetch_bids():
     end_date = now.strftime('%Y%m%d2359')
     
     # [중요] 포털에 명시된 최신 주소 (중간에 /ad/ 포함 여부 확인)
-    url = 'http://apis.data.go.kr/1230000/ad/BidPublicInfoService/getBidPblancListInfoServcPPSSrch'
+    url = 'http://apis.data.go.kr/1230000/ad/BidPublicInfoService05/getBidPblancListInfoServcPPSSrch'
     
     # GitHub Secrets에서 가져온 서비스키
     service_key = os.environ.get('SERVICE_KEY', '')
