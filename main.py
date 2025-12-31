@@ -1,33 +1,50 @@
-import os, json, time, requests, gspread
+import os
+import json
+import time
+import requests
+import gspread
+import urllib.parse
 from datetime import datetime, timedelta
 from oauth2client.service_account import ServiceAccountCredentials
 
+# ----------------------------
+# Config
+# ----------------------------
 BASE_URL = "http://apis.data.go.kr/1230000/BidPublicInfoService05/getBidPblancListInfoServcPPSSrch"
 
-# ✅ 선생님 의도 그대로 유지
+# ✅ 선생님 의도(유지)
 INCLUDE_KEYWORDS = ['브랜딩', '마케팅', '컨설팅', '스타트업', '소상공인', '브랜드', '리브랜딩', 'BI', 'CI', '네이밍']
 EXCLUDE_KEYWORDS = ['실행', '대행', '운영', '제작']
 
-MY_INDUSTRIES = ['1169', '4440', '9999']      # indstrytyCd(4자리) :contentReference[oaicite:3]{index=3}
-ALLOWED_REGION_CODES = ['11', '00']          # prtcptLmtRgnCd: 서울(11), 전국(00) :contentReference[oaicite:4]{index=4}
+# ✅ 업종 제한(4자리)
+MY_INDUSTRIES = ['1169', '4440', '9999']
 
-# PPSSrch 날짜 파라미터 :contentReference[oaicite:5]{index=5}
-INQRY_DIV = os.environ.get("INQRY_DIV", "1")     # 1: 공고게시일시, 2: 개찰일시(환경에 맞게)
-DAYS_BACK = int(os.environ.get("DAYS_BACK", "7"))
+# ✅ 지역 범위: 서울(11) + 전국(00)
+ALLOWED_REGION_CODES = ['11', '00']
 
+# ✅ PPSSrch 날짜 파라미터
+INQRY_DIV = os.environ.get("INQRY_DIV", "1")  # 1: 공고게시일시, 2: 개찰일시
+DAYS_BACK = int(os.environ.get("DAYS_BACK", "2"))
+
+# ✅ API 호출 세팅
 NUM_OF_ROWS = int(os.environ.get("NUM_OF_ROWS", "100"))
 TIMEOUT_SEC = int(os.environ.get("TIMEOUT_SEC", "20"))
 MAX_RETRY = int(os.environ.get("MAX_RETRY", "3"))
 
+# ✅ Google Sheets
 SHEET_NAME = os.environ.get("SHEET_NAME", "나라장터_수집")
 WORKSHEET_INDEX = int(os.environ.get("WORKSHEET_INDEX", "0"))
 
-# (선택) 중복폭발 방지: 시트에서 기존 pk를 일부 읽어와서 재수집 방지
+# ✅ 중복폭발 방지(옵션)
 READ_EXISTING_PK = os.environ.get("READ_EXISTING_PK", "1") == "1"
-EXISTING_PK_LOOKBACK = int(os.environ.get("EXISTING_PK_LOOKBACK", "5000"))  # 최근 N개만 확인
+EXISTING_PK_LOOKBACK = int(os.environ.get("EXISTING_PK_LOOKBACK", "5000"))
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
 def _safe_items(payload: dict):
+    """API 응답에서 items를 안전하게 list로 반환(단건 dict 방어)"""
     body = payload.get("response", {}).get("body", {})
     items = body.get("items", [])
     if isinstance(items, dict):
@@ -44,38 +61,22 @@ def _get_total_count(payload: dict) -> int:
 
 
 def _is_ok(payload: dict) -> bool:
+    """200이어도 header의 resultCode 확인"""
     header = payload.get("response", {}).get("header", {})
     return str(header.get("resultCode", "")).strip() in ("00", "0", "SUCCESS")
 
 
-def _request_with_retry(url: str, params: dict) -> requests.Response:
-    last = None
-    for attempt in range(1, MAX_RETRY + 1):
-        try:
-            res = requests.get(url, params=params, timeout=TIMEOUT_SEC)
-            if res.status_code >= 500:
-                wait = 2 ** (attempt - 1)
-                time.sleep(wait)
-                continue
-            return res
-        except Exception as e:
-            last = e
-            wait = 2 ** (attempt - 1)
-            time.sleep(wait)
-    raise RuntimeError(f"API 요청 실패(재시도 소진): {last}")
-
-
 def _matches_title_rules(title: str) -> bool:
-    # 포함 키워드 1개 이상 포함
+    """포함 키워드 1개 이상 + 제외 키워드 없음"""
     if not any(k in title for k in INCLUDE_KEYWORDS):
         return False
-    # 제외 키워드 있으면 탈락
     if any(x in title for x in EXCLUDE_KEYWORDS):
         return False
     return True
 
 
 def _format_price(item: dict) -> str:
+    """대표 금액: presmptPrce > bdgtAmt > assignAmt"""
     raw = item.get("presmptPrce") or item.get("bdgtAmt") or item.get("assignAmt") or ""
     if raw in (None, ""):
         return ""
@@ -85,19 +86,55 @@ def _format_price(item: dict) -> str:
         return str(raw)
 
 
+def _request_with_retry(url: str, params: dict) -> requests.Response:
+    """
+    - 5xx면 재시도
+    - 실패 원인 파악용으로 마지막 status/text/exception을 남김
+    """
+    last_exc = None
+    last_status = None
+    last_text = None
+
+    for attempt in range(1, MAX_RETRY + 1):
+        try:
+            res = requests.get(url, params=params, timeout=TIMEOUT_SEC)
+
+            if res.status_code >= 500:
+                last_status = res.status_code
+                last_text = (res.text or "")[:200]
+                wait = 2 ** (attempt - 1)
+                print(f"⚠️ HTTP {res.status_code} 재시도 {attempt}/{MAX_RETRY} ({wait}s) - {last_text}")
+                time.sleep(wait)
+                continue
+
+            return res
+
+        except Exception as e:
+            last_exc = e
+            wait = 2 ** (attempt - 1)
+            print(f"⚠️ 요청 예외 재시도 {attempt}/{MAX_RETRY} ({wait}s): {e}")
+            time.sleep(wait)
+
+    raise RuntimeError(f"API 요청 실패(재시도 소진): status={last_status}, text={last_text}, exc={last_exc}")
+
+
+# ----------------------------
+# Main
+# ----------------------------
 def fetch_and_update():
     now = datetime.now()
     start_dt = (now - timedelta(days=DAYS_BACK)).strftime("%Y%m%d0000")
     end_dt = now.strftime("%Y%m%d2359")
 
-    service_key = os.environ.get("SERVICE_KEY", "").strip()
+    # ✅ 핵심 패치 1) SERVICE_KEY 더블 인코딩 방지: unquote
+    service_key = urllib.parse.unquote(os.environ.get("SERVICE_KEY", "").strip())
     if not service_key:
         raise ValueError("SERVICE_KEY 환경변수가 비어 있습니다.")
 
+    # Google creds
     creds_json = os.environ.get("GOOGLE_CREDS", "")
     if not creds_json:
         raise ValueError("GOOGLE_CREDS 환경변수가 비어 있습니다.")
-
     creds_dict = json.loads(creds_json)
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -106,12 +143,11 @@ def fetch_and_update():
 
     # 헤더 없으면 추가
     if not sheet.acell("A1").value:
-        sheet.append_row(["pk","title","agency","price","region_cd","industry_cd","matched_kws","notice_dt","detail_url","collected_at"])
+        sheet.append_row(["pk", "title", "agency", "price", "region_cd", "industry_cd", "matched_kws", "notice_dt", "detail_url", "collected_at"])
 
-    # 기존 pk 일부 로드(옵션)
+    # ✅ (옵션) 기존 pk 일부 로드
     existing_pk = set()
     if READ_EXISTING_PK:
-        # A열(pk)에서 최근 N개만 가져오기 (시트가 커도 부담 완화)
         last_row = sheet.row_count
         start_row = max(2, last_row - EXISTING_PK_LOOKBACK + 1)
         rng = f"A{start_row}:A{last_row}"
@@ -128,7 +164,6 @@ def fetch_and_update():
 
     for region_cd in ALLOWED_REGION_CODES:
         for ind_cd in MY_INDUSTRIES:
-
             page = 1
             total_count = None
 
@@ -139,21 +174,20 @@ def fetch_and_update():
                     "numOfRows": NUM_OF_ROWS,
                     "pageNo": page,
 
-                    # ✅ PPSSrch 규격 :contentReference[oaicite:6]{index=6}
+                    # ✅ PPSSrch 규격
                     "inqryDiv": INQRY_DIV,
                     "inqryBgnDt": start_dt,
                     "inqryEndDt": end_dt,
 
-                    # ✅ 요청 단계 필터(업종/지역) :contentReference[oaicite:7]{index=7} :contentReference[oaicite:8]{index=8}
+                    # ✅ 요청 단계 필터(업종/지역)
                     "prtcptLmtRgnCd": region_cd,
                     "indstrytyCd": ind_cd,
-
-                    # ❌ 최적화 포인트: bidNtceNm(키워드) 파라미터 제거
                 }
 
                 res = _request_with_retry(BASE_URL, params)
+
                 if res.status_code != 200:
-                    print(f"❌ HTTP {res.status_code} / ind={ind_cd} rgn={region_cd} : {res.text[:120]}")
+                    print(f"❌ HTTP {res.status_code} / ind={ind_cd} rgn={region_cd} : {(res.text or '')[:200]}")
                     break
 
                 payload = res.json()
@@ -174,7 +208,7 @@ def fetch_and_update():
                     if not title:
                         continue
 
-                    # ✅ 여기서 포함/제외 키워드 필터 적용(사후 필터)
+                    # ✅ 제목에서 포함/제외 키워드 필터(최적화)
                     if not _matches_title_rules(title):
                         continue
 
@@ -191,7 +225,6 @@ def fetch_and_update():
                     if READ_EXISTING_PK and pk in existing_pk:
                         continue
 
-                    # 매칭 키워드(가시성 강화): 어떤 키워드가 걸렸는지 저장
                     matched = [k for k in INCLUDE_KEYWORDS if k in title]
                     matched_kws = ",".join(matched)
 
@@ -208,7 +241,7 @@ def fetch_and_update():
                         now.strftime("%Y-%m-%d %H:%M:%S"),
                     ])
 
-                # 페이지 종료 조건(총건수 기반): totalCount가 있으면 더 정확
+                # totalCount 기반 페이지 종료(정확)
                 if total_count is not None:
                     max_page = (total_count + NUM_OF_ROWS - 1) // NUM_OF_ROWS
                     if page >= max_page:
@@ -223,7 +256,7 @@ def fetch_and_update():
         return
 
     sheet.append_rows(rows)
-    print(f"🎉 최종 저장 완료: {len(rows)}건 (키워드 호출 제거 최적화 + 중복 방지 포함)")
+    print(f"🎉 최종 저장 완료: {len(rows)}건 (최적화 + 중복 방지 포함)")
 
 
 if __name__ == "__main__":
