@@ -1,24 +1,48 @@
-name: Daily Bid Automation
+name: 나라장터 입찰공고 자동 수집 (09:00 KST)
 
 on:
   schedule:
-    - cron: '0 0 * * *' # UTC 기준 00:00 (한국 시간 오전 9시)
-  workflow_dispatch: # 수동 실행 버튼 활성화
+    - cron: "0 0 * * *" # 매일 UTC 00:00 = KST 09:00
+  workflow_dispatch:
 
 jobs:
-  run-bot:
+  run:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
-      - name: Install Dependencies
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
         run: |
-          pip install requests pandas gspread oauth2client openpyxl
-      - name: Run Script
+          python -m pip install --upgrade pip
+          pip install requests gspread oauth2client
+
+      - name: Run collector
         env:
+          # ✅ GitHub Secrets에 등록
           SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
           GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
-        run: python main.py
+
+          # ✅ 필요하면 GitHub Actions Variables(또는 Secrets)로 관리 권장
+          SHEET_NAME: 나라장터_수집
+          WORKSHEET_INDEX: "0"
+
+          # ✅ 오전 9시 배치 권장값
+          DAYS_BACK: "2"         # 누락 방지(전일~당일 걸침 대비)
+          INQRY_DIV: "1"         # 공고게시일시 기준(일반적으로 추천)
+          NUM_OF_ROWS: "100"
+          TIMEOUT_SEC: "20"
+          MAX_RETRY: "3"
+
+          # ✅ 최적화 코드에서 사용(있다면)
+          READ_EXISTING_PK: "1"
+          EXISTING_PK_LOOKBACK: "5000"
+        run: |
+          python main.py
