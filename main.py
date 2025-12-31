@@ -86,6 +86,15 @@ def _format_price(item: dict) -> str:
         return str(raw)
 
 
+def _pick_field(item: dict, *candidates):
+    """필드명이 다를 수 있어 후보를 순서대로 탐색"""
+    for k in candidates:
+        v = item.get(k)
+        if v not in (None, ""):
+            return str(v).strip()
+    return ""
+
+
 def _request_with_retry(url: str, params: dict) -> requests.Response:
     """
     - 5xx면 재시도
@@ -118,6 +127,27 @@ def _request_with_retry(url: str, params: dict) -> requests.Response:
     raise RuntimeError(f"API 요청 실패(재시도 소진): status={last_status}, text={last_text}, exc={last_exc}")
 
 
+def _call_ppssrch(service_key: str, params: dict) -> requests.Response:
+    """
+    일부 공공 API는 json 파라미터 키가 _type / type 중 하나만 먹는 경우가 있어
+    1) _type=json로 먼저 시도
+    2) 5xx(Unexpected errors)면 type=json로 재시도
+    """
+    # 1) _type
+    p1 = dict(params)
+    p1["_type"] = "json"
+    res = _request_with_retry(BASE_URL, p1)
+
+    if res.status_code >= 500 and "Unexpected" in (res.text or ""):
+        # 2) type
+        p2 = dict(params)
+        p2.pop("_type", None)
+        p2["type"] = "json"
+        res = _request_with_retry(BASE_URL, p2)
+
+    return res
+
+
 # ----------------------------
 # Main
 # ----------------------------
@@ -126,7 +156,7 @@ def fetch_and_update():
     start_dt = (now - timedelta(days=DAYS_BACK)).strftime("%Y%m%d0000")
     end_dt = now.strftime("%Y%m%d2359")
 
-    # ✅ 핵심 패치 1) SERVICE_KEY 더블 인코딩 방지: unquote
+    # ✅ SERVICE_KEY 더블 인코딩 방지: unquote
     service_key = urllib.parse.unquote(os.environ.get("SERVICE_KEY", "").strip())
     if not service_key:
         raise ValueError("SERVICE_KEY 환경변수가 비어 있습니다.")
@@ -157,106 +187,117 @@ def fetch_and_update():
                 existing_pk.add(row[0])
 
     print(f"🚀 최적화 수집 시작: {now:%Y-%m-%d %H:%M:%S} / {start_dt}~{end_dt}")
-    print(f"   - 업종 {len(MY_INDUSTRIES)} × 지역 {len(ALLOWED_REGION_CODES)} (키워드 호출 제거)")
+    print(f"   - 최적화 방식: 키워드(서버필수)만 호출 + 업종/지역은 응답에서 필터")
 
     rows = []
     seen_pk_run = set()
 
-    for region_cd in ALLOWED_REGION_CODES:
-        for ind_cd in MY_INDUSTRIES:
-            page = 1
-            total_count = None
+    # ✅ 핵심: 키워드 호출은 유지(서버가 빈 검색을 500으로 튕기는 것으로 보임)
+    for kw in INCLUDE_KEYWORDS:
+        page = 1
+        total_count = None
 
-            while True:
-                params = {
-                    "serviceKey": service_key,
-                    "type": "json",
-                    "numOfRows": NUM_OF_ROWS,
-                    "pageNo": page,
+        while True:
+            params = {
+                "serviceKey": service_key,
+                "numOfRows": NUM_OF_ROWS,
+                "pageNo": page,
 
-                    # ✅ PPSSrch 규격
-                    "inqryDiv": INQRY_DIV,
-                    "inqryBgnDt": start_dt,
-                    "inqryEndDt": end_dt,
+                # PPSSrch 규격
+                "inqryDiv": INQRY_DIV,
+                "inqryBgnDt": start_dt,
+                "inqryEndDt": end_dt,
 
-                    # ✅ 요청 단계 필터(업종/지역)
-                    "prtcptLmtRgnCd": region_cd,
-                    "indstrytyCd": ind_cd,
-                }
+                # ✅ 서버가 정상 처리하도록 검색어는 반드시 포함
+                "bidNtceNm": kw,
+            }
 
-                res = _request_with_retry(BASE_URL, params)
+            res = _call_ppssrch(service_key, params)
 
-                if res.status_code != 200:
-                    print(f"❌ HTTP {res.status_code} / ind={ind_cd} rgn={region_cd} : {(res.text or '')[:200]}")
+            if res.status_code != 200:
+                print(f"❌ HTTP {res.status_code} / kw={kw} : {(res.text or '')[:200]}")
+                break
+
+            payload = res.json()
+            if not _is_ok(payload):
+                header = payload.get("response", {}).get("header", {})
+                print(f"⚠️ resultCode 비정상 / kw={kw} : {header}")
+                break
+
+            if total_count is None:
+                total_count = _get_total_count(payload)
+
+            items = _safe_items(payload)
+            if not items:
+                break
+
+            for item in items:
+                title = (item.get("bidNtceNm") or "").strip()
+                if not title:
+                    continue
+
+                # ✅ 제외/포함(타겟) 필터는 제목에서 최종 확정
+                if not _matches_title_rules(title):
+                    continue
+
+                # ✅ 업종/지역 필터는 "응답값"에서 적용 (요청에서 빼서 호출수/500 리스크 감소)
+                # 필드명이 환경에 따라 다를 수 있어 후보를 여럿 둠
+                ind_cd = _pick_field(item, "indstrytyCd", "indstrytyCdNm", "indstryTy", "indstryTyCd")
+                rgn_cd = _pick_field(item, "prtcptLmtRgnCd", "prtcptLmtRgnCdNm", "prtcptLmtRgnNm")
+
+                # 업종코드는 보통 4자리 코드가 들어가므로, 코드형태만 우선 필터링
+                if ind_cd and (ind_cd not in MY_INDUSTRIES):
+                    continue
+
+                # 지역코드도 2자리 코드가 들어가는 케이스가 많아 코드 우선 적용
+                if rgn_cd and (rgn_cd not in ALLOWED_REGION_CODES):
+                    continue
+
+                bid_no = str(item.get("bidNtceNo", "")).strip()
+                bid_ord = str(item.get("bidNtceOrd", "")).strip()
+                pk = f"{bid_no}-{bid_ord}" if (bid_no or bid_ord) else f"{title}|{item.get('ntceInstNm','')}|{item.get('bidNtceDt','')}"
+
+                # 실행 내 중복
+                if pk in seen_pk_run:
+                    continue
+                seen_pk_run.add(pk)
+
+                # 시트 기존 중복
+                if READ_EXISTING_PK and pk in existing_pk:
+                    continue
+
+                matched = [k for k in INCLUDE_KEYWORDS if k in title]
+                matched_kws = ",".join(matched)
+
+                rows.append([
+                    pk,
+                    title,
+                    item.get("ntceInstNm", ""),
+                    _format_price(item),
+                    rgn_cd,               # 응답에서 잡힌 지역코드(또는 빈값)
+                    ind_cd,               # 응답에서 잡힌 업종코드(또는 빈값)
+                    matched_kws,
+                    item.get("bidNtceDt", ""),
+                    item.get("bidNtceDtlUrl", ""),
+                    now.strftime("%Y-%m-%d %H:%M:%S"),
+                ])
+
+            # totalCount 기반 페이지 종료(정확)
+            if total_count is not None:
+                max_page = (total_count + NUM_OF_ROWS - 1) // NUM_OF_ROWS
+                if page >= max_page:
                     break
 
-                payload = res.json()
-                if not _is_ok(payload):
-                    header = payload.get("response", {}).get("header", {})
-                    print(f"⚠️ resultCode 비정상 / ind={ind_cd} rgn={region_cd} : {header}")
-                    break
+            page += 1
 
-                if total_count is None:
-                    total_count = _get_total_count(payload)
-
-                items = _safe_items(payload)
-                if not items:
-                    break
-
-                for item in items:
-                    title = (item.get("bidNtceNm") or "").strip()
-                    if not title:
-                        continue
-
-                    # ✅ 제목에서 포함/제외 키워드 필터(최적화)
-                    if not _matches_title_rules(title):
-                        continue
-
-                    bid_no = str(item.get("bidNtceNo", "")).strip()
-                    bid_ord = str(item.get("bidNtceOrd", "")).strip()
-                    pk = f"{bid_no}-{bid_ord}" if (bid_no or bid_ord) else f"{title}|{item.get('ntceInstNm','')}|{item.get('bidNtceDt','')}"
-
-                    # 실행 내 중복
-                    if pk in seen_pk_run:
-                        continue
-                    seen_pk_run.add(pk)
-
-                    # 시트 기존 중복
-                    if READ_EXISTING_PK and pk in existing_pk:
-                        continue
-
-                    matched = [k for k in INCLUDE_KEYWORDS if k in title]
-                    matched_kws = ",".join(matched)
-
-                    rows.append([
-                        pk,
-                        title,
-                        item.get("ntceInstNm", ""),
-                        _format_price(item),
-                        region_cd,
-                        ind_cd,
-                        matched_kws,
-                        item.get("bidNtceDt", ""),
-                        item.get("bidNtceDtlUrl", ""),
-                        now.strftime("%Y-%m-%d %H:%M:%S"),
-                    ])
-
-                # totalCount 기반 페이지 종료(정확)
-                if total_count is not None:
-                    max_page = (total_count + NUM_OF_ROWS - 1) // NUM_OF_ROWS
-                    if page >= max_page:
-                        break
-
-                page += 1
-
-            print(f"✅ 완료 ind={ind_cd} rgn={region_cd} / 신규후보(누적) {len(rows)}건")
+        print(f"✅ 완료 kw={kw} / 신규후보(누적) {len(rows)}건")
 
     if not rows:
         print("📭 신규 데이터가 없습니다.")
         return
 
     sheet.append_rows(rows)
-    print(f"🎉 최종 저장 완료: {len(rows)}건 (최적화 + 중복 방지 포함)")
+    print(f"🎉 최종 저장 완료: {len(rows)}건 (키워드 유지 최적화 + 중복 방지 포함)")
 
 
 if __name__ == "__main__":
