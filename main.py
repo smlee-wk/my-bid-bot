@@ -10,32 +10,25 @@ from oauth2client.service_account import ServiceAccountCredentials
 # ----------------------------
 # Config
 # ----------------------------
-BASE_URL = "http://apis.data.go.kr/1230000/BidPublicInfoService05/getBidPblancListInfoServcPPSSrch"
+# ✅ HTTPS로 변경 (중요)
+BASE_URL = "https://apis.data.go.kr/1230000/BidPublicInfoService05/getBidPblancListInfoServcPPSSrch"
 
-# ✅ 선생님 의도(유지)
 INCLUDE_KEYWORDS = ['브랜딩', '마케팅', '컨설팅', '스타트업', '소상공인', '브랜드', '리브랜딩', 'BI', 'CI', '네이밍']
 EXCLUDE_KEYWORDS = ['실행', '대행', '운영', '제작']
 
-# ✅ 업종 제한(4자리)
 MY_INDUSTRIES = ['1169', '4440', '9999']
-
-# ✅ 지역 범위: 서울(11) + 전국(00)
 ALLOWED_REGION_CODES = ['11', '00']
 
-# ✅ PPSSrch 날짜 파라미터
-INQRY_DIV = os.environ.get("INQRY_DIV", "1")  # 1: 공고게시일시, 2: 개찰일시
+INQRY_DIV = os.environ.get("INQRY_DIV", "1")
 DAYS_BACK = int(os.environ.get("DAYS_BACK", "2"))
 
-# ✅ API 호출 세팅
 NUM_OF_ROWS = int(os.environ.get("NUM_OF_ROWS", "100"))
 TIMEOUT_SEC = int(os.environ.get("TIMEOUT_SEC", "20"))
 MAX_RETRY = int(os.environ.get("MAX_RETRY", "3"))
 
-# ✅ Google Sheets
 SHEET_NAME = os.environ.get("SHEET_NAME", "나라장터_수집")
 WORKSHEET_INDEX = int(os.environ.get("WORKSHEET_INDEX", "0"))
 
-# ✅ 중복폭발 방지(옵션)
 READ_EXISTING_PK = os.environ.get("READ_EXISTING_PK", "1") == "1"
 EXISTING_PK_LOOKBACK = int(os.environ.get("EXISTING_PK_LOOKBACK", "5000"))
 
@@ -44,7 +37,6 @@ EXISTING_PK_LOOKBACK = int(os.environ.get("EXISTING_PK_LOOKBACK", "5000"))
 # Helpers
 # ----------------------------
 def _safe_items(payload: dict):
-    """API 응답에서 items를 안전하게 list로 반환(단건 dict 방어)"""
     body = payload.get("response", {}).get("body", {})
     items = body.get("items", [])
     if isinstance(items, dict):
@@ -61,13 +53,11 @@ def _get_total_count(payload: dict) -> int:
 
 
 def _is_ok(payload: dict) -> bool:
-    """200이어도 header의 resultCode 확인"""
     header = payload.get("response", {}).get("header", {})
     return str(header.get("resultCode", "")).strip() in ("00", "0", "SUCCESS")
 
 
 def _matches_title_rules(title: str) -> bool:
-    """포함 키워드 1개 이상 + 제외 키워드 없음"""
     if not any(k in title for k in INCLUDE_KEYWORDS):
         return False
     if any(x in title for x in EXCLUDE_KEYWORDS):
@@ -76,7 +66,6 @@ def _matches_title_rules(title: str) -> bool:
 
 
 def _format_price(item: dict) -> str:
-    """대표 금액: presmptPrce > bdgtAmt > assignAmt"""
     raw = item.get("presmptPrce") or item.get("bdgtAmt") or item.get("assignAmt") or ""
     if raw in (None, ""):
         return ""
@@ -87,7 +76,6 @@ def _format_price(item: dict) -> str:
 
 
 def _pick_field(item: dict, *candidates):
-    """필드명이 다를 수 있어 후보를 순서대로 탐색"""
     for k in candidates:
         v = item.get(k)
         if v not in (None, ""):
@@ -95,11 +83,7 @@ def _pick_field(item: dict, *candidates):
     return ""
 
 
-def _request_with_retry(url: str, params: dict) -> requests.Response:
-    """
-    - 5xx면 재시도
-    - 실패 원인 파악용으로 마지막 status/text/exception을 남김
-    """
+def _request_with_retry(url: str, params: dict, label: str) -> requests.Response:
     last_exc = None
     last_status = None
     last_text = None
@@ -112,7 +96,7 @@ def _request_with_retry(url: str, params: dict) -> requests.Response:
                 last_status = res.status_code
                 last_text = (res.text or "")[:200]
                 wait = 2 ** (attempt - 1)
-                print(f"⚠️ HTTP {res.status_code} 재시도 {attempt}/{MAX_RETRY} ({wait}s) - {last_text}")
+                print(f"⚠️ [{label}] HTTP {res.status_code} 재시도 {attempt}/{MAX_RETRY} ({wait}s) - {last_text}")
                 time.sleep(wait)
                 continue
 
@@ -121,29 +105,34 @@ def _request_with_retry(url: str, params: dict) -> requests.Response:
         except Exception as e:
             last_exc = e
             wait = 2 ** (attempt - 1)
-            print(f"⚠️ 요청 예외 재시도 {attempt}/{MAX_RETRY} ({wait}s): {e}")
+            print(f"⚠️ [{label}] 요청 예외 재시도 {attempt}/{MAX_RETRY} ({wait}s): {e}")
             time.sleep(wait)
 
-    raise RuntimeError(f"API 요청 실패(재시도 소진): status={last_status}, text={last_text}, exc={last_exc}")
+    raise RuntimeError(f"[{label}] API 요청 실패(재시도 소진): status={last_status}, text={last_text}, exc={last_exc}")
 
 
-def _call_ppssrch(service_key: str, params: dict) -> requests.Response:
+def _call_ppssrch(service_key: str, base_params: dict) -> requests.Response:
     """
-    일부 공공 API는 json 파라미터 키가 _type / type 중 하나만 먹는 경우가 있어
-    1) _type=json로 먼저 시도
-    2) 5xx(Unexpected errors)면 type=json로 재시도
+    ✅ 핵심: serviceKey를 params로 넘기지 않고 URL에 직접 붙여서(인코딩 꼬임 방지)
+    _type/type도 자동 fallback.
+    또한 혹시 서버가 _type/type 키 이름에 민감하면 자동 전환.
     """
-    # 1) _type
-    p1 = dict(params)
+    # serviceKey는 "한 번만" 인코딩된 형태로 URL에 부착
+    # - 이미 %2F 같은 게 들어있어도 그대로 유지되도록 safe='%' 옵션 사용
+    sk_for_url = urllib.parse.quote(service_key, safe="%")
+
+    url_with_key = f"{BASE_URL}?serviceKey={sk_for_url}"
+
+    # 1) _type=json
+    p1 = dict(base_params)
     p1["_type"] = "json"
-    res = _request_with_retry(BASE_URL, p1)
+    res = _request_with_retry(url_with_key, p1, label="URLKey+_type")
 
+    # 500 Unexpected이면 2) type=json
     if res.status_code >= 500 and "Unexpected" in (res.text or ""):
-        # 2) type
-        p2 = dict(params)
-        p2.pop("_type", None)
+        p2 = dict(base_params)
         p2["type"] = "json"
-        res = _request_with_retry(BASE_URL, p2)
+        res = _request_with_retry(url_with_key, p2, label="URLKey+type")
 
     return res
 
@@ -156,12 +145,11 @@ def fetch_and_update():
     start_dt = (now - timedelta(days=DAYS_BACK)).strftime("%Y%m%d0000")
     end_dt = now.strftime("%Y%m%d2359")
 
-    # ✅ SERVICE_KEY 더블 인코딩 방지: unquote
+    # ✅ serviceKey: 디코드(unquote)는 하되, URL에 붙일 때는 quote(safe='%')로 "한 번만" 인코딩
     service_key = urllib.parse.unquote(os.environ.get("SERVICE_KEY", "").strip())
     if not service_key:
         raise ValueError("SERVICE_KEY 환경변수가 비어 있습니다.")
 
-    # Google creds
     creds_json = os.environ.get("GOOGLE_CREDS", "")
     if not creds_json:
         raise ValueError("GOOGLE_CREDS 환경변수가 비어 있습니다.")
@@ -171,48 +159,40 @@ def fetch_and_update():
     client = gspread.authorize(creds)
     sheet = client.open(SHEET_NAME).get_worksheet(WORKSHEET_INDEX)
 
-    # 헤더 없으면 추가
     if not sheet.acell("A1").value:
         sheet.append_row(["pk", "title", "agency", "price", "region_cd", "industry_cd", "matched_kws", "notice_dt", "detail_url", "collected_at"])
 
-    # ✅ (옵션) 기존 pk 일부 로드
     existing_pk = set()
     if READ_EXISTING_PK:
         last_row = sheet.row_count
         start_row = max(2, last_row - EXISTING_PK_LOOKBACK + 1)
-        rng = f"A{start_row}:A{last_row}"
-        vals = sheet.get(rng)
-        for row in vals:
-            if row and row[0]:
-                existing_pk.add(row[0])
+        vals = sheet.get(f"A{start_row}:A{last_row}")
+        for r in vals:
+            if r and r[0]:
+                existing_pk.add(r[0])
 
     print(f"🚀 최적화 수집 시작: {now:%Y-%m-%d %H:%M:%S} / {start_dt}~{end_dt}")
-    print(f"   - 최적화 방식: 키워드(서버필수)만 호출 + 업종/지역은 응답에서 필터")
+    print(f"   - 호출 방식: HTTPS + serviceKey를 URL에 직접 부착(인코딩 꼬임 방지)")
+    print(f"   - 키워드 호출 유지(서버가 빈조건을 500으로 튕기는 경우 대비)")
 
     rows = []
     seen_pk_run = set()
 
-    # ✅ 핵심: 키워드 호출은 유지(서버가 빈 검색을 500으로 튕기는 것으로 보임)
     for kw in INCLUDE_KEYWORDS:
         page = 1
         total_count = None
 
         while True:
-            params = {
-                "serviceKey": service_key,
+            base_params = {
                 "numOfRows": NUM_OF_ROWS,
                 "pageNo": page,
-
-                # PPSSrch 규격
                 "inqryDiv": INQRY_DIV,
                 "inqryBgnDt": start_dt,
                 "inqryEndDt": end_dt,
-
-                # ✅ 서버가 정상 처리하도록 검색어는 반드시 포함
-                "bidNtceNm": kw,
+                "bidNtceNm": kw,  # 서버 안정성 위해 유지
             }
 
-            res = _call_ppssrch(service_key, params)
+            res = _call_ppssrch(service_key, base_params)
 
             if res.status_code != 200:
                 print(f"❌ HTTP {res.status_code} / kw={kw} : {(res.text or '')[:200]}")
@@ -236,33 +216,27 @@ def fetch_and_update():
                 if not title:
                     continue
 
-                # ✅ 제외/포함(타겟) 필터는 제목에서 최종 확정
+                # 포함/제외 최종 확정
                 if not _matches_title_rules(title):
                     continue
 
-                # ✅ 업종/지역 필터는 "응답값"에서 적용 (요청에서 빼서 호출수/500 리스크 감소)
-                # 필드명이 환경에 따라 다를 수 있어 후보를 여럿 둠
-                ind_cd = _pick_field(item, "indstrytyCd", "indstrytyCdNm", "indstryTy", "indstryTyCd")
-                rgn_cd = _pick_field(item, "prtcptLmtRgnCd", "prtcptLmtRgnCdNm", "prtcptLmtRgnNm")
+                # 업종/지역: 응답에서 필터(필드명 변동 대비 후보 여러 개)
+                ind_cd = _pick_field(item, "indstrytyCd", "indstryTyCd", "indstryTy")
+                rgn_cd = _pick_field(item, "prtcptLmtRgnCd")
 
-                # 업종코드는 보통 4자리 코드가 들어가므로, 코드형태만 우선 필터링
-                if ind_cd and (ind_cd not in MY_INDUSTRIES):
+                if ind_cd and ind_cd not in MY_INDUSTRIES:
                     continue
-
-                # 지역코드도 2자리 코드가 들어가는 케이스가 많아 코드 우선 적용
-                if rgn_cd and (rgn_cd not in ALLOWED_REGION_CODES):
+                if rgn_cd and rgn_cd not in ALLOWED_REGION_CODES:
                     continue
 
                 bid_no = str(item.get("bidNtceNo", "")).strip()
                 bid_ord = str(item.get("bidNtceOrd", "")).strip()
                 pk = f"{bid_no}-{bid_ord}" if (bid_no or bid_ord) else f"{title}|{item.get('ntceInstNm','')}|{item.get('bidNtceDt','')}"
 
-                # 실행 내 중복
                 if pk in seen_pk_run:
                     continue
                 seen_pk_run.add(pk)
 
-                # 시트 기존 중복
                 if READ_EXISTING_PK and pk in existing_pk:
                     continue
 
@@ -274,15 +248,14 @@ def fetch_and_update():
                     title,
                     item.get("ntceInstNm", ""),
                     _format_price(item),
-                    rgn_cd,               # 응답에서 잡힌 지역코드(또는 빈값)
-                    ind_cd,               # 응답에서 잡힌 업종코드(또는 빈값)
+                    rgn_cd,
+                    ind_cd,
                     matched_kws,
                     item.get("bidNtceDt", ""),
                     item.get("bidNtceDtlUrl", ""),
                     now.strftime("%Y-%m-%d %H:%M:%S"),
                 ])
 
-            # totalCount 기반 페이지 종료(정확)
             if total_count is not None:
                 max_page = (total_count + NUM_OF_ROWS - 1) // NUM_OF_ROWS
                 if page >= max_page:
@@ -297,7 +270,7 @@ def fetch_and_update():
         return
 
     sheet.append_rows(rows)
-    print(f"🎉 최종 저장 완료: {len(rows)}건 (키워드 유지 최적화 + 중복 방지 포함)")
+    print(f"🎉 최종 저장 완료: {len(rows)}건")
 
 
 if __name__ == "__main__":
