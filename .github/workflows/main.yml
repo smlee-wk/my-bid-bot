@@ -2,7 +2,7 @@ name: 나라장터 입찰공고 자동 수집 (09:00 KST)
 
 on:
   schedule:
-    - cron: "0 0 * * *" # 매일 UTC 00:00 = KST 09:00
+    - cron: "0 0 * * *"   # 매일 UTC 00:00 = KST 09:00
   workflow_dispatch:
 
 jobs:
@@ -17,7 +17,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          # ❌ cache 옵션 제거
 
       - name: Install dependencies
         run: |
@@ -26,22 +26,18 @@ jobs:
 
       - name: Run collector
         env:
-          # ✅ GitHub Secrets에 등록
           SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
           GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
 
-          # ✅ 필요하면 GitHub Actions Variables(또는 Secrets)로 관리 권장
           SHEET_NAME: 나라장터_수집
           WORKSHEET_INDEX: "0"
 
-          # ✅ 오전 9시 배치 권장값
-          DAYS_BACK: "2"         # 누락 방지(전일~당일 걸침 대비)
-          INQRY_DIV: "1"         # 공고게시일시 기준(일반적으로 추천)
+          DAYS_BACK: "2"
+          INQRY_DIV: "1"
           NUM_OF_ROWS: "100"
           TIMEOUT_SEC: "20"
           MAX_RETRY: "3"
 
-          # ✅ 최적화 코드에서 사용(있다면)
           READ_EXISTING_PK: "1"
           EXISTING_PK_LOOKBACK: "5000"
         run: |
